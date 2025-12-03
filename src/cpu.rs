@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 
+
 pub const MEMORY_SIZE: usize = 4096;
 pub const NUM_REGS: usize = 16;
 pub const STACK_SIZE: usize = 16;
@@ -47,16 +48,58 @@ impl Cpu {
     }
 
     pub fn load_rom(&mut self, path: &str) -> std::io::Result<()> {
-        let mut file = File::open(path)?;
+        let mut file = File::open(path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Failed to open ROM '{}': {}", path, e)
+            )
+        })?;
+
         let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
+        file.read_to_end(&mut buffer).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Failed to read ROM '{}': {}", path, e)
+            )
+        })?;
 
         for (i, byte) in buffer.iter().enumerate() {
+            if 0x200 + i >= MEMORY_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "ROM '{}' is too large ({} bytes). Max allowed is {} bytes.",
+                        path,
+                        buffer.len(),
+                        MEMORY_SIZE - 0x200
+                    ),
+                ));
+            }
             self.memory[0x200 + i] = *byte;
         }
 
         Ok(())
     }
+
+
+    pub fn clear_keys(&mut self) {
+        self.keypad = [false; 16];
+    }
+
+    pub fn set_key(&mut self, key: isize) {
+        self.keypad[key as usize] = true;
+        println!("Key pressed {key}");
+    }
+
+    pub fn update_timers(&mut self) {
+        if self.delay_timer > 0 {
+            self.delay_timer -= 1;
+        }
+        if self.sound_timer > 0 {
+            self.sound_timer -= 1;
+            // optionally trigger a beep here
+    }
+}
     
     fn load_default_font(&mut self) {
         let font =  [
@@ -154,15 +197,12 @@ impl Cpu {
     }
 
     fn op_clear_screen(&mut self) {
-        for y in 0..DISPLAY_HEIGHT {
-            for x in 0..DISPLAY_WIDTH {
-                self.display[y][x] = 0;
-            }
-        }
+        self.display = [[0;DISPLAY_WIDTH]; DISPLAY_HEIGHT];
     }
 
     fn op_return(&mut self) {
-
+        self.sp -= 1;
+        self.pc = self.stack[self.sp as usize];
     }
 
     fn op_jmp(&mut self, addr: u16) {
@@ -170,19 +210,27 @@ impl Cpu {
     }
 
     fn op_call(&mut self, addr: u16) {
-        
+        self.stack[self.sp as usize] = self.pc;
+        self.pc = addr;
+        self.sp += 1;
     }
 
     fn op_skip_eq_byte(&mut self, x: usize, byte: u8) {
-        
+        if byte == self.v[x] {
+            self.pc += 2;
+        }
     }
 
     fn op_skip_neq_byte(&mut self, x: usize, byte: u8) {
-        
+        if byte != self.v[x] {
+            self.pc += 2;
+        }
     }
 
     fn op_skip_eq_reg(&mut self, x: usize, y: usize) {
-        
+        if self.v[y] == self.v[x] {
+            self.pc += 2;
+        }
     }
 
     fn op_load_byte(&mut self, x: usize, byte: u8) {
@@ -190,47 +238,58 @@ impl Cpu {
     }
 
     fn op_add_byte(&mut self, x: usize, byte: u8) {
-        self.v[x] += byte;
+        self.v[x] = self.v[x].wrapping_add(byte);
     }
 
     fn op_load_reg(&mut self, x: usize, y: usize) {
-
+        self.v[x] = self.v[y];
     }
 
     fn op_or(&mut self, x: usize, y: usize) {
-
+        self.v[x] |= self.v[y];
     }
 
     fn op_and(&mut self, x: usize, y: usize) {
-
+        self.v[x] &= self.v[y];
     }
 
     fn op_xor(&mut self, x: usize, y: usize) {
-
+        self.v[x] ^= self.v[y];
     }
 
     fn op_add_reg(&mut self, x: usize, y: usize) {
-
+        let (sum, overflow) = self.v[x].overflowing_add(self.v[y]);
+        self.v[x] = sum;
+        self.v[0xF] = if overflow {1} else {0};
     }
 
     fn op_sub_xy(&mut self, x: usize, y: usize) {
-
+        let (sum, overflow) = self.v[x].overflowing_sub(self.v[y]);
+        self.v[x] = sum;
+        self.v[0xF] = if overflow {0} else {1};
     }
 
     fn op_shift_right(&mut self, x: usize, y: usize) {
-
+        // TODO: Amb flag imp
+        self.v[0xF] = self.v[y] & 0x1;
+        self.v[x] = self.v[y] >> 1;
     }
 
     fn op_sub_yx(&mut self, x: usize, y: usize) {
-
+        let (sum, overflow) = self.v[y].overflowing_sub(self.v[x]);
+        self.v[x] = sum;
+        self.v[0xF] = if overflow {0} else {1};
     }
 
     fn op_shift_left(&mut self, x: usize, y: usize) {
-
+        self.v[0xF] = (self.v[y] & 0x80) >> 7;
+        self.v[x] = self.v[y] << 1;
     }
 
     fn op_skip_neq_reg(&mut self, x: usize, y: usize) {
-
+        if self.v[y] != self.v[x] {
+            self.pc += 2;
+        }
     }
 
     fn op_load_i(&mut self, val: u16) {
@@ -238,11 +297,12 @@ impl Cpu {
     }
 
     fn op_jmp_off(&mut self, addr: u16) {
-
+        self.pc = addr + self.v[0] as u16;
     }
 
     fn op_rand(&mut self, x: usize, byte: u8) {
-
+        let value: u8 = rand::random();// random byte, 0–255
+        self.v[x] = value & byte;
     }
 
     fn op_disp(&mut self, x: usize, y: usize, n: u8) {
@@ -269,46 +329,65 @@ impl Cpu {
     }
 
     fn op_skip_key_press(&mut self, x: usize) {
-
+        if self.keypad[self.v[x] as usize] == true {
+            self.pc += 2;
+        }
     }
 
     fn op_skip_key_npress(&mut self, x: usize) {
-
+        if self.keypad[self.v[x] as usize] == false {
+            self.pc += 2;
+        }
     }
 
     fn op_load_del(&mut self, x: usize) {
-
+        self.v[x] = self.delay_timer;
     }
 
     fn op_set_del(&mut self, x: usize) {
-
+        self.delay_timer = self.v[x];
     }
 
     fn op_set_snd(&mut self, x: usize) {
-
+        self.sound_timer = self.v[x];
     }
 
     fn op_add_i_reg(&mut self, x: usize) {
-
+        self.i += self.v[x] as u16;
     }
 
     fn op_wait_key(&mut self, x: usize) {
+        for key in 0..16 {
+        if self.keypad[key] {
+            self.v[x] = key as u8;
+            return;
+            }
+        }
 
+        // No key pressed → repeat this instruction next cycle
+        self.pc -= 2;
     }
 
     fn op_font(&mut self, x: usize) {
-
+        self.i = FONT_START as u16 + self.v[x] as u16;
     }
 
     fn op_conv(&mut self, x: usize) {
-
+        let val = self.v[x];
+        self.memory[self.i as usize] = (val/100) as u8;
+        self.memory[(self.i + 1) as usize] = ((val%100)/10) as u8;
+        self.memory[(self.i + 2) as usize] = (val%10) as u8;
     }
 
     fn op_store_regs(&mut self, x: usize) {
-
+        for e in 0..(x+1){
+            self.memory[self.i as usize+e] = self.v[e];
+        }
     }
 
     fn op_load_regs(&mut self, x: usize) {
-
+        for e in 0..(x+1){
+            self.v[e] = self.memory[self.i as usize+e];
+        }
     }
 }
